@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "turboquant-bio"
+version = "0.1.0"
+description = "Compressed, correct Evo 2 inference: int4 weights/KV, block-wise chunked prefill, 40B on a single GPU"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+dependencies = [
+    "torch>=2.0",
+    "numpy",
+    "huggingface_hub",
+]
+
+# evo2, vortex, transformer_engine, triton, flash-attn and pyfaidx are NOT hard
+# dependencies on purpose: they are environment-specific (CUDA version, GPU
+# architecture) and anyone running Evo 2 already has them. Pulling them in from
+# here would fight the user's existing install.
+
+[project.optional-dependencies]
+dev = ["pyfaidx", "scipy"]
+
+[project.urls]
+Homepage = "https://github.com/michalispatsakis/turboquant-bio"
+
+[tool.setuptools]
+packages = ["turboquant"]
