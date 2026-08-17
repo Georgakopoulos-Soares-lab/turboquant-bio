@@ -24,7 +24,7 @@ dependencies = [
 dev = ["pyfaidx", "scipy"]
 
 [project.urls]
-Homepage = "https://github.com/michalispatsakis/turboquant-bio"
+Homepage = "https://github.com/Georgakopoulos-Soares-lab/turboquant-bio"
 
 [tool.setuptools]
 packages = ["turboquant"]

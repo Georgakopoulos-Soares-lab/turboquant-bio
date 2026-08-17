@@ -97,6 +97,20 @@ def load_evo2(model_name: str = "evo2_7b", tier: str = "baseline",
     if tier not in _TIERS:
         raise ValueError(f"tier must be one of {_TIERS}, got {tier!r}")
 
+    # Evo 2 is intentionally NOT a dependency of this package (vortex,
+    # transformer_engine and flash-attn are built against a specific CUDA
+    # version and GPU, so installing them automatically breaks more
+    # environments than it fixes). Fail with an actionable message rather than
+    # a bare ImportError from three frames down.
+    try:
+        import evo2  # noqa: F401
+    except ImportError as e:
+        raise ImportError(
+            "TurboQuant-Bio needs a working Evo 2 install, which it does not "
+            "provide. Install Evo 2 first (https://github.com/ArcInstitute/evo2), "
+            "check `python -c \"from evo2 import Evo2\"` succeeds, then retry."
+        ) from e
+
     if "40b" in model_name:
         from turboquant._te_multigpu_patch import patch_te_multi_gpu_amax_reduce
         patch_te_multi_gpu_amax_reduce()

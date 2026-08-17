@@ -1,184 +1,203 @@
 # TurboQuant-Bio
 
-Run [Evo 2](https://github.com/ArcInstitute/evo2) compressed, on less hardware,
-and — importantly — **correctly**.
+Compressed [Evo 2](https://github.com/ArcInstitute/evo2) inference, so you can run
+the big model on the hardware you actually have — plus a fix for a correctness
+problem in Evo 2's long-sequence path.
 
-* **Evo 2 40B on a single 80 GB GPU**, where bf16 cannot be loaded at all
-  (33.8 GB resident, 883 tok/s). It is also *faster* than running across 4 GPUs.
-* **A correctness fix** for Evo 2's chunked-prefill path, which is silently
-  wrong upstream — it returns plausible numbers that are essentially
-  uncorrelated with the truth on any sequence longer than one chunk.
-* **A measurement of Evo 2's effective context**: the benefit from real
-  upstream context peaks near **32 kb** and then *declines*.
+Three things this gives you:
 
-Full findings, tables and derivations: **[FINDINGS.md](FINDINGS.md)**.
+**The 40B model on a single GPU.** In bf16 the 40B needs about 82 GB just for
+weights, so it will not load on an 80 GB card at all. With int4 weights it takes
+33.8 GB and runs comfortably on one card, at 883 tokens/s. It turns out to be
+*faster* on one GPU than on four, because splitting the model across devices means
+copying activations between cards at every layer.
+
+**The 7B on a single A100.** It already fits in bf16 (3.3 GB of weights), and int4
+brings it down far enough for much smaller cards (5.5 GB).
+
+**Long sequences that are actually correct.** A single forward pass in Evo 2 is
+capped at 65,536 tokens for the 40B and 131,072 for the 7B. Going beyond that
+means feeding the sequence in chunks — and Evo 2's chunked path is broken
+upstream. It doesn't crash or warn; it just returns numbers that look reasonable
+and are wrong. We fixed it, and verified that **quality is unaffected**: chunked
+scoring matches a single exact pass to within round-off, and the error does not
+grow as you add more chunks (checked up to 127 of them). The fix is applied
+automatically — you don't have to remember anything.
+
+Details and measurements: **[FINDINGS.md](FINDINGS.md)**.
 
 ---
 
-## Install
+## Installing
 
 ```bash
-git clone https://github.com/michalispatsakis/turboquant-bio.git
+git clone https://github.com/Georgakopoulos-Soares-lab/turboquant-bio.git
 cd turboquant-bio
 pip install -e .
 ```
 
-You need a working Evo 2 install first (`evo2`, `vortex`, and for the 40B
-`transformer_engine`). TurboQuant-Bio sits on top of it and does not try to
-manage those environment-specific packages for you.
+**You need Evo 2 installed first — this does not install it for you.** That is
+deliberate: Evo 2 depends on `vortex`, `transformer_engine` and `flash-attn`,
+which are built against your specific CUDA version and GPU. Pulling them in
+automatically tends to break working environments rather than help. Follow
+[Arc Institute's instructions](https://github.com/ArcInstitute/evo2), confirm
+plain Evo 2 runs, then install this on top.
 
-## Quickstart
+Quick check that your environment is ready:
+
+```bash
+python -c "from evo2 import Evo2; print('evo2 ok')"
+python tests/test_release.py --level fast     # a few seconds, no GPU needed
+```
+
+---
+
+## Using it
 
 ```python
 from turboquant import load_evo2, score
 
-# 7B, unmodified weights, with the chunked-prefill fix applied
 model, tok = load_evo2("evo2_7b", tier="baseline")
 print(score(model, tok, my_sequence, model_name="evo2_7b"))
 ```
 
+The 40B on one GPU — the int4 weights download automatically the first time
+(33.8 GB, cached afterwards):
+
 ```python
-# 40B on ONE 80 GB GPU. The int4 checkpoint is downloaded and cached on first use.
 model, tok = load_evo2("evo2_40b", tier="tier2", device="cuda:0")
 print(score(model, tok, my_sequence, model_name="evo2_40b"))
 ```
 
-`score()` returns mean log-likelihood per base (higher is better; human DNA
-typically lands near −0.85 to −1.1). `return_per_token=True` gives the per-base
-array.
+`score()` gives you the mean log-likelihood per base; higher is better, and human
+DNA usually lands around −0.85 to −1.1. Ask for `return_per_token=True` if you
+want the value at every position.
+
+There is also a small command-line example:
+
+```bash
+python examples/score_sequence.py --fasta my.fa --model evo2_40b --tier tier2
+```
 
 ---
 
-## Tiers
+## Which tier?
 
-| tier | weights | KV cache | needs a checkpoint? | use when |
+| tier | weights | KV cache | download needed | when to use it |
 |---|---|---|---|---|
 | `baseline` | bf16 | bf16 | no | you have the memory and want reference numbers |
-| `tier1` | bf16 | int4 | **no** | long context on a big card: 4× smaller KV cache, weights untouched |
-| `tier2` | int4 | int4 | yes (auto-downloaded) | the model does not otherwise fit — e.g. 40B on one GPU |
+| `tier1` | bf16 | int4 | no | long sequences on a big card — the cache is 4× smaller, weights untouched |
+| `tier2` | int4 | int4 | yes, automatic | the model doesn't otherwise fit, e.g. the 40B on one GPU |
 
-Tier 1 needs no download because KV quantization happens at runtime.
+Tier 1 needs no download because the cache is quantized as you go. Only tier 2
+uses the pre-quantized weights.
 
-Accuracy cost, measured against a full-precision unchunked forward with **zero**
-chunk boundaries, so this isolates each tier's own quantization error (40B, 8 kb):
+What it costs you in accuracy, measured against an exact full-precision pass
+(40B, 8 kb, no chunk boundaries so this is purely the quantization):
 
-| tier | Pearson vs exact | max abs error |
+| tier | correlation with exact | worst single-base error |
 |---|---|---|
-| baseline | 1.000000 (bit-exact) | 0.0000 |
+| baseline | 1.000000 (identical) | 0.0000 |
 | tier1 | 0.999859 | 0.31 |
 | tier2 | 0.992944 | 2.12 |
 
-On the 7B at 8 kb, through this API against a known exact value of −0.90382:
-baseline −0.90374, tier1 −0.90361, tier2 −0.90698.
+On the 7B, against a known exact value of −0.90382: baseline −0.90374,
+tier1 −0.90361, tier2 −0.90698.
 
 ---
 
-## Hardware
+## What runs where
 
-Measured on H100s, capped to an 80 GB budget so the numbers transfer to the card
-most labs have. "Peak" is at 32 kb context.
+Measured on H100s with the process capped to 80 GB, so the numbers apply to a
+normal 80 GB card. Peak is at 32 kb of context.
 
-| model | tier | GPUs | resident | peak | throughput |
+| model | tier | GPUs | weights | peak memory | speed |
 |---|---|---|---|---|---|
-| evo2_40b | baseline | 1 × 80 GB | — | — | **cannot load** (OOM at block 46/50) |
-| evo2_40b | tier2 | 1 × 80 GB | 33.8 GB | 49.0 GB | **883 tok/s** |
-| evo2_40b | tier2 | 4 × 80 GB | 8.9 GB/GPU | 18.2 GB/GPU | 641 tok/s |
-| evo2_7b | baseline | 1 × 80 GB | 3.3 GB | comfortable | 4,789 tok/s |
-| evo2_7b | tier2 | 1 × 16 GB | 5.5 GB | comfortable | — |
+| 40B | baseline | 1 × 80 GB | — | — | **will not load** |
+| 40B | tier2 | 1 × 80 GB | 33.8 GB | 49.0 GB | 883 tok/s |
+| 40B | tier2 | 4 × 80 GB | 8.9 GB each | 18.2 GB each | 641 tok/s |
+| 7B | baseline | 1 × A100 | 3.3 GB | comfortable | 4,789 tok/s |
+| 7B | tier2 | 1 × 16 GB | 5.5 GB | comfortable | — |
 
-**One GPU is faster than four** for single-sequence scoring. Sharding ships
-activations between cards at every layer, and that costs more than the
-parallelism returns. Use one card unless you need the memory.
+---
 
-The 7B already fits a single A100/H100 in bf16 — use tier2 for it only on
-smaller cards.
+## Long sequences
+
+Anything longer than one forward pass (65,536 tokens on the 40B, 131,072 on the
+7B) is fed in chunks, and `score()` handles that for you. Two things worth
+knowing:
+
+**Quality holds.** Chunked scoring reproduces a single exact pass to round-off,
+and crucially the error does not accumulate: results are the same whether the
+sequence is split into 7 chunks or 127. So there is no accuracy reason to prefer
+larger chunks.
+
+**About 32 kb of context is the sweet spot.** We measured how much Evo 2 actually
+uses, and the benefit from real upstream sequence peaks near 32 kb and then gets
+slightly *worse*. Feeding half a megabase is not an improvement over 32 kb.
+`score()` mentions this if you go well past it, but it will still run.
+
+Chunk size is chosen for you (1024 for the 40B, 4096 for the 7B). If you override
+it, note that chunk size — not the cache — is what drives peak memory: for the
+40B, chunks of 4096 or larger will exhaust an 80 GB card.
 
 ---
 
 ## Checkpoints
 
-Pre-quantized int4 weights:
+The int4 weights live on the Hub and are fetched automatically:
 [michalakis99/turboquant-evo2-int4](https://huggingface.co/michalakis99/turboquant-evo2-int4)
+(`evo2_40b_int4.pt`, 33.8 GB; `evo2_7b_int4.pt`, 5.4 GB).
 
-| file | size |
-|---|---|
-| `evo2_40b_int4.pt` | 33.8 GB |
-| `evo2_7b_int4.pt` | 5.4 GB |
-
-Fetched automatically by `load_evo2(..., tier="tier2")`. To build your own on a
-machine large enough to hold bf16:
+Pass `int4_ckpt="/path/to/file.pt"` to use a local copy, or build your own on a
+machine big enough to hold bf16:
 
 ```bash
 python tools/make_int4_checkpoint.py --model evo2_40b --out evo2_40b_int4.pt
-python tools/make_int4_checkpoint.py --model evo2_7b  --out evo2_7b_int4.pt
 ```
 
-Note the 40B checkpoint is 33.8 GB, not the 16.8 GB the Linear-only compression
-ratio suggests: only `nn.Linear` layers are quantized (208 of them, 65.3 → 16.8
-GB, 3.88×), while Hyena filters, embeddings and norms stay bf16.
+The 40B file is 33.8 GB rather than the ~17 GB you might expect from the 3.88×
+compression, because only the linear layers are quantized — Evo 2's Hyena filters
+and embeddings stay in bf16.
 
 ---
 
-## How much context should I use?
-
-**About 32 kb.** Evo 2's benefit from real upstream context peaks near 32 kb and
-then declines — measured across 8 loci on both the 7B and 40B, paired Wilcoxon
-p = 0.0078 ([FINDINGS.md §10](FINDINGS.md)). Feeding 500 kb is slightly *worse*
-than feeding 32 kb.
-
-`score()` warns above ~49 kb; the warning is advice, not a limit.
-
-## Chunk size
-
-Defaults are chosen for you (1024 for the 40B, 4096 for the 7B). If you override
-it: **chunk size, not the KV cache, drives peak memory** — the Hyena modal-FFT
-buffer is ≈8.6 GB at chunk 4096 for the 40B, so 4096 and 8192 both OOM on an
-80 GB card while 1024 peaks at 49 GB.
-
-Fidelity is **independent** of chunk size (verified to 127 boundaries), so
-lowering it costs nothing but wall-clock.
-
----
-
-## Verifying your install
+## Checking it works
 
 ```bash
-# seconds, no GPU, no checkpoint
-python tests/test_release.py --level fast
+python tests/test_release.py --level fast        # seconds, no GPU
 
-# adds a pinned numerical check on real weights
-export TURBOQUANT_HG38=/path/to/hg38.fa
+export TURBOQUANT_HG38=/path/to/hg38.fa         # for the full check
 python tests/test_release.py --level full \
     --int4-ckpt evo2_40b_int4.pt --int4-ckpt-7b evo2_7b_int4.pt
 ```
 
-The pinned check matters: every bug found while building this produced
-plausible-looking numbers rather than a crash, so only a pinned expected value
-catches a regression.
+The full check compares against recorded log-likelihoods rather than just looking
+for a crash. That matters here: every bug we hit while building this produced
+plausible-looking output, so agreement with a known value is the only real signal.
 
 ---
 
-## Gotchas
+## A few things to watch out for
 
-* **Do not call the stateless path under tier1/tier2.** The fused attention does
-  not accept `key_padding_mask`, so `model(ids)` with no inference params raises
-  `TypeError`. Compute any full-precision reference *before* installing a KV tier.
-* **Do not move a multi-GPU model onto one card with `.to("cuda:0")`.**
-  Device-bound state (flash-FFT plans, cuBLAS workspaces) is not relocated and
-  you get an illegal memory access. Load on the target device instead.
-* **Context beyond ~524 kb currently faults** in the fused int4-KV kernel — an
-  int32 indexing overflow, patched but not yet re-verified at that scale.
-* **If the checkpoint repo is private, you must be authenticated** (`hf auth
-  login`). Note that setting `HF_HOME` moves where the token is looked for: a
-  token written to `~/.cache/huggingface/token` is invisible if `HF_HOME` points
-  elsewhere, and the download then fails with a bare `401`. Either log in after
-  setting `HF_HOME`, or export `HF_TOKEN`.
+* Under tier1/tier2, don't call the model without inference params
+  (`model(ids)`) — the fused attention doesn't accept that path and raises a
+  `TypeError`. Compute any full-precision reference before switching tier.
+* Don't load the model across several GPUs and then move it to one with
+  `.to("cuda:0")`. Some internal state is tied to the original device and you
+  will get a memory fault. Load it on the device you want.
+* Context beyond roughly 524 kb currently fails in the int4 cache kernel (an
+  indexing overflow we've patched but not yet re-verified at that size).
+* If you set `HF_HOME`, set it *before* logging in to the Hub — the token is
+  looked up relative to it, and a mismatch shows up as a bare `401`. Not an issue
+  for the checkpoints here, which are public and need no login.
 
 ---
 
-## Credit and licence
+## Credit
 
-The models are [Evo 2](https://github.com/ArcInstitute/evo2) by Arc Institute;
-this project provides compression, a correctness fix, and measurements on top of
-them. The published checkpoints are quantized re-encodings of Arc Institute's
-weights and inherit their licence. Code here is Apache-2.0.
+The models are [Evo 2](https://github.com/ArcInstitute/evo2) by Arc Institute —
+all credit for them belongs there. This project adds compression, the
+long-sequence fix, and the measurements above. The published checkpoints are
+quantized re-encodings of Arc Institute's weights and inherit their licence; the
+code here is Apache-2.0.
