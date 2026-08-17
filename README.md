@@ -28,27 +28,58 @@ Details and measurements: **[FINDINGS.md](FINDINGS.md)**.
 
 ---
 
-## Installing
+## What a new user actually does
+
+Three steps, and **no Hugging Face account is needed at anything** — every model
+file involved is public and downloads anonymously.
+
+**1. Install Evo 2.** Follow [Arc Institute's
+instructions](https://github.com/ArcInstitute/evo2). This is the part that takes
+effort, because `vortex`, `transformer_engine` and `flash-attn` compile against
+your CUDA version. Check it worked:
+
+```bash
+python -c "from evo2 import Evo2; print('ok')"
+```
+
+**2. Install this on top.**
 
 ```bash
 git clone https://github.com/Georgakopoulos-Soares-lab/turboquant-bio.git
-cd turboquant-bio
-pip install -e .
+cd turboquant-bio && pip install -e .
+python tests/test_release.py --level fast      # seconds, no GPU
 ```
 
-**You need Evo 2 installed first — this does not install it for you.** That is
-deliberate: Evo 2 depends on `vortex`, `transformer_engine` and `flash-attn`,
-which are built against your specific CUDA version and GPU. Pulling them in
-automatically tends to break working environments rather than help. Follow
-[Arc Institute's instructions](https://github.com/ArcInstitute/evo2), confirm
-plain Evo 2 runs, then install this on top.
+**3. Run it.** Weights download automatically on first use and are cached:
 
-Quick check that your environment is ready:
-
-```bash
-python -c "from evo2 import Evo2; print('evo2 ok')"
-python tests/test_release.py --level fast     # a few seconds, no GPU needed
+```python
+from turboquant import load_evo2, score
+model, tok = load_evo2("evo2_40b", tier="tier2")     # one 80 GB GPU
+print(score(model, tok, my_sequence, model_name="evo2_40b"))
 ```
+
+What gets downloaded depends on the tier, and it is worth knowing before you
+start, because the sizes differ a lot:
+
+| tier | what it downloads | 7B | 40B |
+|---|---|---|---|
+| `baseline`, `tier1` | Arc's original bf16 weights (Evo 2 fetches these itself) | ~15 GB | ~80 GB |
+| `tier2` | **only** our int4 checkpoint — the original weights are never needed | 5.4 GB | 33.8 GB |
+
+So tier 2 is not just smaller in memory, it is a much smaller download: the 40B
+comes down as 33.8 GB instead of 80 GB, and works on a machine that could never
+hold the bf16 model.
+
+---
+
+## Why Evo 2 isn't installed for you
+
+`pip install -e .` does **not** pull in Evo 2, and that is deliberate rather than
+an oversight. Evo 2 needs `vortex`, `transformer_engine` and `flash-attn`, all of
+which build against your specific CUDA version and GPU architecture. Declaring
+them as dependencies would let pip reinstall and break environments that already
+work. `load_evo2()` checks for Evo 2 up front and tells you what to do if it is
+missing.
 
 ---
 
@@ -188,9 +219,9 @@ plausible-looking output, so agreement with a known value is the only real signa
   will get a memory fault. Load it on the device you want.
 * Context beyond roughly 524 kb currently fails in the int4 cache kernel (an
   indexing overflow we've patched but not yet re-verified at that size).
-* If you set `HF_HOME`, set it *before* logging in to the Hub — the token is
-  looked up relative to it, and a mismatch shows up as a bare `401`. Not an issue
-  for the checkpoints here, which are public and need no login.
+* All weights used here are public, so no Hugging Face login is required. If you
+  do log in *and* set `HF_HOME`, set `HF_HOME` first — the token is looked up
+  relative to it, and a mismatch surfaces as a bare `401`.
 
 ---
 

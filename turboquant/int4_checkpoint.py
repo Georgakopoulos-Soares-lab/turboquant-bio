@@ -114,20 +114,43 @@ def _swap_block(block: nn.Module, prefix: str, meta: dict, state: dict,
     return swapped
 
 
+def _build_skeleton(model_name: str):
+    """Construct the model from its config alone, downloading nothing.
+
+    `evo2.Evo2(...)` downloads the ORIGINAL bf16 checkpoint before it ever calls
+    load_checkpoint -- ~80 GB for the 40B -- and we then discard it, because the
+    int4 file already holds every weight. So we replicate the two things Evo2's
+    constructor actually needs (the yaml config and the tokenizer) and skip the
+    fetch. Without this, tier2 costs a user 80 GB of useless download on top of
+    the 33.8 GB they need.
+    """
+    import pkgutil
+
+    import yaml
+    from evo2.utils import CONFIG_MAP
+    from vortex.model.model import StripedHyena
+    from vortex.model.tokenizer import CharLevelTokenizer
+    from vortex.model.utils import dotdict
+
+    cfg = yaml.safe_load(pkgutil.get_data("evo2.models", CONFIG_MAP[model_name]))
+    model = StripedHyena(dotdict(cfg, Loader=yaml.FullLoader))
+    return model, CharLevelTokenizer(512)
+
+
 def load_int4_model(model_name: str, path: str, device: str = "cuda:0",
                     verbose: bool = True):
-    """Build `model_name` directly in int4 on a single device."""
+    """Build `model_name` directly in int4 on a single device.
+
+    Downloads nothing except the int4 checkpoint itself.
+    """
     ck = torch.load(path, map_location="cpu", weights_only=False)
     if ck.get("format") != "turboquant-int4-v1":
         raise ValueError(f"not a turboquant int4 checkpoint: {path}")
     meta, state = ck["quant_meta"], ck["state"]
 
     import vortex.model.model as vm
-    import vortex.model.utils as vu
 
     orig_move = vm.move_to_device
-    orig_load_vm = getattr(vm, "load_checkpoint", None)
-    orig_load_vu = vu.load_checkpoint
     counter = {"i": 0, "swapped": 0}
 
     def patched_move(mod, dev):
@@ -136,41 +159,11 @@ def load_int4_model(model_name: str, path: str, device: str = "cuda:0",
         counter["i"] += 1
         counter["swapped"] += _swap_block(mod, f"blocks.{i}", meta, state, device)
 
-    # vortex would otherwise reload the full bf16 checkpoint over the top of the
-    # int4 layers we just installed, which both defeats the purpose and fails on
-    # missing keys. Everything needed is already in the int4 file.
-    def noop_load(model, weights_path, *a, **kw):
-        return model
-
-    # Patch load_checkpoint at EVERY binding site, not just in vortex.model.utils.
-    # evo2/models.py does `from vortex.model.utils import load_checkpoint` at
-    # import time, so it holds its OWN reference; patching the utils module alone
-    # only works if evo2 has not been imported yet. That made this fail exactly
-    # when a user loads a second model in the same process -- vortex then reloads
-    # the bf16 checkpoint over the int4 layers and raises on the missing
-    # _indices/_norms keys.
-    import evo2
-    import evo2.models as _em
-    orig_load_em = getattr(_em, "load_checkpoint", None)
-
     vm.move_to_device = patched_move
-    vu.load_checkpoint = noop_load
-    if hasattr(vm, "load_checkpoint"):
-        vm.load_checkpoint = noop_load
-    if orig_load_em is not None:
-        _em.load_checkpoint = noop_load
     try:
-        obj = evo2.Evo2(model_name)
-        model, tok = obj.model, obj.tokenizer
+        model, tok = _build_skeleton(model_name)
     finally:
-        # Restore the ORIGINALS captured before patching. Reading them back off
-        # the module here would just re-install the no-op permanently.
         vm.move_to_device = orig_move
-        vu.load_checkpoint = orig_load_vu
-        if orig_load_vm is not None:
-            vm.load_checkpoint = orig_load_vm
-        if orig_load_em is not None:
-            _em.load_checkpoint = orig_load_em
 
     # Load everything that was NOT quantized (embeddings, norms, biases, ...).
     #
