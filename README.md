@@ -100,6 +100,19 @@ model, tok = load_evo2("evo2_40b", tier="tier2", device="cuda:0")
 print(score(model, tok, my_sequence, model_name="evo2_40b"))
 ```
 
+**More than one GPU, for long sequences.** Pass `device="auto"` and the int4
+model is sharded across every visible GPU:
+
+```python
+model, tok = load_evo2("evo2_40b", tier="tier2", device="auto")
+```
+
+Use this once your sequence gets long. The weights fit on a single card, but the
+KV cache grows with the sequence and eventually will not: scoring a complete
+580 kb bacterial genome in one context peaks at about 45 GB in total. `"auto"`
+spreads that across the GPUs you have, and it still loads straight from the int4
+checkpoint, so the 82 GB bf16 model is never materialized.
+
 `score()` gives you the mean log-likelihood per base; higher is better, and human
 DNA usually lands around −0.85 to −1.1. Ask for `return_per_token=True` if you
 want the value at every position.
@@ -118,7 +131,7 @@ python examples/score_sequence.py --fasta my.fa --model evo2_40b --tier tier2
 |---|---|---|---|---|
 | `baseline` | bf16 | bf16 | no | you have the memory and want reference numbers |
 | `tier1` | bf16 | int4 | no | long sequences on a big card — the cache is 4× smaller, weights untouched |
-| `tier2` | int4 | int4 | yes, automatic | the model doesn't otherwise fit, e.g. the 40B on one GPU |
+| `tier2` | int4 | int4 | yes, automatic | the model doesn't otherwise fit, e.g. the 40B on one GPU — or `device="auto"` across several for long context |
 
 Tier 1 needs no download because the cache is quantized as you go. Only tier 2
 uses the pre-quantized weights.

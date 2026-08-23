@@ -137,11 +137,47 @@ def _build_skeleton(model_name: str):
     return model, CharLevelTokenizer(512)
 
 
+def _warm_te_workspaces() -> None:
+    """Allocate Transformer Engine's cuBLAS workspace on every visible device.
+
+    TE keeps one workspace per device and allocates it lazily, on that device's
+    first GEMM. Under sharding that first GEMM happens in the middle of a
+    forward pass, and creating the cuBLAS handle there fails with
+
+        cuBLAS Error: an internal operation failed   (CreateCublasHandle)
+
+    after the first two devices. Touching each device once here, while nothing
+    else is in flight, gets the workspaces built up front. No-op without TE.
+    """
+    try:
+        import transformer_engine.pytorch.module.linear as telinear
+    except ImportError:
+        return
+    for i in range(torch.cuda.device_count()):
+        with torch.cuda.device(i):
+            try:
+                telinear.get_workspace()
+            except Exception as e:                      # pragma: no cover
+                print(f"[int4-load] WARNING: could not pre-allocate TE "
+                      f"workspace on cuda:{i}: {e}", flush=True)
+
+
 def load_int4_model(model_name: str, path: str, device: str = "cuda:0",
                     verbose: bool = True):
-    """Build `model_name` directly in int4 on a single device.
+    """Build `model_name` directly in int4, without ever materializing bf16.
 
     Downloads nothing except the int4 checkpoint itself.
+
+    `device` is either an explicit device string, which pins every block there,
+    or the string "auto", which honours the placement vortex computes from the
+    visible GPUs and therefore shards the model across all of them.
+
+    "auto" is what makes the checkpoint usable for long context. The weights fit
+    on one card, but the KV cache does not: past a few hundred kilobases it
+    needs more memory than any single accelerator has. Without sharding here,
+    reaching those lengths in int4 meant loading the 82 GB bf16 model first and
+    quantizing it in place -- which requires exactly the hardware the
+    compression exists to avoid.
     """
     ck = torch.load(path, map_location="cpu", weights_only=False)
     if ck.get("format") != "turboquant-int4-v1":
@@ -152,12 +188,17 @@ def load_int4_model(model_name: str, path: str, device: str = "cuda:0",
 
     orig_move = vm.move_to_device
     counter = {"i": 0, "swapped": 0}
+    auto = (device == "auto")
 
     def patched_move(mod, dev):
-        orig_move(mod, device)
+        # In "auto" mode `dev` is vortex's own choice for this block; pinning
+        # every block to one device is what previously made the checkpoint
+        # single-GPU only.
+        tgt = dev if auto else device
+        orig_move(mod, tgt)
         i = counter["i"]
         counter["i"] += 1
-        counter["swapped"] += _swap_block(mod, f"blocks.{i}", meta, state, device)
+        counter["swapped"] += _swap_block(mod, f"blocks.{i}", meta, state, tgt)
 
     vm.move_to_device = patched_move
     try:
@@ -185,7 +226,10 @@ def load_int4_model(model_name: str, path: str, device: str = "cuda:0",
         if tgt is None:
             missing.append(k)
             continue
-        tgt.data = v.to(device)
+        # Follow the destination, not one fixed card: under sharding the
+        # embeddings, norms and biases live on whichever device their block
+        # was placed on. (Identical to the old behaviour when pinned.)
+        tgt.data = v.to(tgt.device)
     unexpected = []
 
     # Second pass, and it is NOT redundant. `_extra_state` (TransformerEngine's
@@ -200,12 +244,31 @@ def load_int4_model(model_name: str, path: str, device: str = "cuda:0",
         model.load_state_dict(state, strict=False)
     except Exception as e:                      # pragma: no cover
         print(f"[int4-load] WARNING: extra-state pass failed: {e}", flush=True)
-    if hasattr(model, "block_idx_to_device"):
+
+    # TE restores fp8 extra state onto the DEFAULT cuda device, not the device
+    # the layer actually lives on, so under sharding every block's fp8 scales
+    # and amax history stay on cuda:0 while its weights sit on cuda:1..N. The
+    # FP8 `projections` GEMM then dies with
+    #     cuBLAS Error: an internal operation failed  (CreateCublasHandle)
+    # vortex hits the same problem and ships the repair; it calls this straight
+    # after load_state_dict in custom_load_state_dict, which we bypass, so we
+    # have to call it ourselves. A no-op when everything is on one device.
+    try:
+        from vortex.model.utils import fixup_fp8_extra_states
+        fixup_fp8_extra_states(model)
+    except ImportError:                         # pragma: no cover
+        pass
+    if hasattr(model, "block_idx_to_device") and not auto:
         model.block_idx_to_device = {k: device for k in model.block_idx_to_device}
+
+    if auto:
+        _warm_te_workspaces()
     if verbose:
         print(f"[int4-load] swapped {counter['swapped']} layers, "
               f"{len(missing)} missing / {len(unexpected)} unexpected keys, "
-              f"resident {torch.cuda.memory_allocated(0)/1e9:.1f} GB", flush=True)
+              f"resident {sum(torch.cuda.memory_allocated(i) for i in range(torch.cuda.device_count()))/1e9:.1f} GB "
+              f"across {torch.cuda.device_count() if auto else 1} device(s)",
+              flush=True)
         if missing:
             # Never wave these through on a checkpoint meant for distribution:
             # a tensor that lands nowhere is a silently wrong model.

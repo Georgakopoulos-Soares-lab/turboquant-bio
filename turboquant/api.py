@@ -84,7 +84,10 @@ def load_evo2(model_name: str = "evo2_7b", tier: str = "baseline",
 
     model_name : "evo2_7b" or "evo2_40b"
     tier       : "baseline" | "tier1" | "tier2"
-    device     : target device for tier2 single-GPU loading
+    device     : where tier2 puts the int4 weights. An explicit device string
+                 ("cuda:0") pins the whole model there; "auto" shards it across
+                 every visible GPU, which is what long context needs -- the
+                 weights fit on one card but the KV cache does not.
     int4_ckpt  : path to a pre-quantized int4 checkpoint (tier2). If omitted,
                  the published checkpoint is downloaded and cached from
                  INT4_REPO. Only if that also fails does tier2 fall back to
