@@ -7,7 +7,7 @@ There is no supported way to advance an EXISTING state across a BLOCK -- the
 routine that would do it, `prefill_via_hybrid_recurrence` ("recurrence-
 convolution over blocks"), is a `NotImplementedError` stub upstream. Feeding
 multi-token blocks anyway silently produces garbage (measured: Pearson ~0
-against an exact forward; see README_chunk_prefill.md).
+against an exact forward; see FINDINGS.md).
 
 Three state carries have to be fixed for a block to be equivalent to one
 continuous pass:

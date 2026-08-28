@@ -1,47 +1,121 @@
-# Chunked prefill is numerically invalid on Evo 2 — findings, impact, and the fix
+# Chunked prefill on Evo 2: the defect, the repair, and the evidence
 
-**Status: action required.** Our chunked-prefill helper produces wrong numbers on
-any sequence longer than one chunk. It does not crash and it does not warn; the
-outputs look plausible. Every long-context experiment we have run with it is
-invalid and must be re-run.
+Evo 2 evaluates a sequence in one parallel pass only up to a fixed length —
+65,536 tokens for the 40B, 131,072 for the 7B. Past that the sequence has to be
+fed in chunks with the model state carried across each boundary. **The released
+code accepts a chunked prefill and silently returns wrong numbers.** It does not
+crash and it does not warn; the per-base log-likelihoods come back in a
+plausible range and are essentially uncorrelated with the truth.
 
-**A fix is now implemented and verified** (§6): with
-`install_block_continuation(model)`, chunked prefill reproduces the exact
-single-pass forward to round-off, against r ≈ 0 before. Verified on `evo2_7b`
-(r = 0.9999), on `evo2_40b` across three loci (r = 0.9965–0.9999, worst on
-low-entropy sequence), and under all three deployment tiers (r ≥ 0.991) — all at
-8,192 bp, and at long context (7B to 131,072 bp with 127 boundaries; 40B to
-65,536). Error does **not** grow with boundary count.
+`turboquant` ships the repair (`install_block_continuation`) and applies it
+automatically inside `load_evo2`, so anything you score through this package is
+correct by construction. This document is the evidence for both halves of that
+claim.
 
-This document records what was measured, why it happens, which results are and
-are not affected, the fix, and what the fix then made measurable:
-**§10** Evo 2's effective context (peaks at ~32 kb, then declines),
-**§11** a controlled negative on long-range enhancer detection,
-**§12** running the 40B on a single 80 GB GPU where bf16 cannot even load,
-**§13** open items.
+## Verification
+
+Re-run from clean processes on 4× H100, bf16, no quantization, on one fixed
+8,192 bp human locus (BRCA1, chr17:43,044,295). Ground truth is a single
+unchunked `model(input_ids)` forward — the same path `score_sequences` uses.
+
+| | | released | | repaired | |
+|---|---|---|---|---|---|
+| **model** | **chunk** | **Pearson r** | **Δ logL** | **Pearson r** | **Δ logL** |
+| 7B | 256 | −0.033 | −6238.58 | 0.999921 | +0.70 |
+| 7B | 512 | 0.003 | −5684.10 | 0.999940 | +0.06 |
+| 7B | 1024 | 0.062 | −4588.57 | 0.999920 | −0.31 |
+| 7B | 2048 | 0.033 | −10433.12 | 0.999934 | −0.24 |
+| 7B | 4096 | 0.297 | −9393.34 | 0.999937 | +0.67 |
+| 7B | 8192 *(no boundary)* | **1.000000** | **0.00** | 1.000000 | 0.00 |
+| 40B | 512 | 0.042 | −4470.36 | 0.999860 | −0.08 |
+| 40B | 1024 | 0.232 | −3976.24 | 0.999832 | −0.63 |
+| 40B | 2048 | 0.111 | −9633.54 | 0.999835 | −1.88 |
+| 40B | 4096 | 0.370 | −6329.98 | 0.999836 | −2.88 |
+| 40B | 8192 *(no boundary)* | **1.000000** | **0.00** | 1.000000 | 0.00 |
+
+Read the zero-boundary rows first: with no boundary to cross, the chunked path
+reproduces the exact forward **bit for bit**, which is what makes the rest of the
+comparison meaningful. Every other released row crosses at least one boundary and
+loses the signal entirely — one boundary is already enough. Repaired, the worst
+case across both models is r = 0.99983 and 2.9 nats over 8,192 bases.
+
+The error does **not** grow with boundary count: 31 boundaries agree with 1 to
+five decimals. Verified separately out to 127 boundaries on the 7B at 131,072 bp.
+
+Reproduce it:
+
+```bash
+python tests/test_block_continuation_layers.py   # the three Hyena operators, CPU, seconds
+python tests/test_release.py --level fast        # the same, plus the recurrence maths
+```
+
+## Why it happens
+
+`HyenaCascade.forward` in `vortex/model/model.py` picks its path from whether
+state exists, and never looks at how many tokens it was given:
+
+```python
+def forward(self, u, inference_params=None, padding_mask=None, *args, **kwargs):
+    if inference_params is not None and self.layer_idx in inference_params.fir_state_dict.keys():
+        return self.sequential_forward(u, inference_params)   # built for ONE token
+    else:
+        return self.parallel_forward(u, inference_params, padding_mask)
+```
+
+The first chunk has no state, so it takes the correct FFT prefill. Every later
+chunk has state, so an L-token block is handed to the single-token path, which
+opens with
+
+```python
+if len(u.shape) > 2:
+    u = u[:, -1]        # keep only the LAST token of the block
+```
+
+and returns one position. That length-1 result then meets the residual stream in
+`ParallelGatedConvBlock.forward` as `z_in = self.out_filter_dense(z) + u`, where
+`u` is still (B, L, D), so PyTorch **broadcasts it silently over all L
+positions**. For every chunk after the first, L−1 of L tokens are never seen by
+any Hyena layer; the mixer contribution at every position is a copy of the one
+computed from the block's last token.
+
+The attention layers keep working normally throughout — `flash_attn_with_kvcache`
+handles multi-token chunked prefill correctly — which is why the output stays
+plausible instead of collapsing. In the 40B that is 42 of 50 blocks degenerate
+and 8 correct, with nothing raised.
+
+Driving the three Hyena operators directly shows it at the operator level: a
+256-token sequence fed as four 64-token blocks comes back with **67** output
+positions (64 + 1 + 1 + 1), and as two 128-token blocks with **129**. With the
+repair, all three reproduce the single-pass output to 1e−7 relative.
+
+Upstream never trips over this itself: `vortex/model/generation.py` feeds
+`x = x[:, -1:]` after prefill, one token at a time, and its documented answer for
+a prompt too long to prefill is `force_prompt_threshold`, which teacher-forces
+the remainder one token at a time. The defect is latent — it is reached by
+writing the natural chunked loop, which is the only tractable route to the long
+contexts the model is built for.
+
+## The repair
+
+The Hyena recurrence is linear, so the state after a block of L tokens starting
+from a non-zero state `s` decomposes exactly into the zero-state result — which
+the existing fast transform already computes — plus a term propagating `s`
+forward. `install_block_continuation` adds that term, corrects the block outputs
+to match, and fixes the short-filter path by prepending the retained history
+before convolution and discarding the corresponding leading outputs. It is
+verified against single-token recursion in isolation, against a single parallel
+pass through the real layers for all three Hyena variants, and end to end against
+exact single-pass scoring on both models.
 
 ---
 
-## 1. TL;DR
-
-| | verdict |
-|---|---|
-| Chunked prefill (feeding a long sequence as repeated multi-token blocks), **as shipped** | **invalid** — per-token log-probs are essentially uncorrelated with the truth |
-| Chunked prefill **with `install_block_continuation`** | **valid** — r = 0.991–0.9999 across 7B, 40B, three loci and all three tiers; at tier2 quantization dominates and chunking is nearly free (§6) |
-| One parallel forward over the whole sequence | **exact** (bit-identical reference) |
-| One parallel prefill, then **single-token** steps | **valid** (Δ = +0.049 nats over 2047 tokens, r = 0.99995) |
-| Paper accuracy figures (perplexity, GUE, splice, BRCA1, gene completion) | **unaffected** — all short-context, single pass |
-| Paper memory figures (Fig 3, Table 2) | **essentially valid** — see §5 |
-| Long-context biological experiments (ciliate, eQTL, long-genes, contact-map) | **invalid, must be re-run** |
-| Max single parallel prefill, evo2_40b on 4× H100 | **65,536 tokens — identical for bf16 and int4-W** (§7) |
-| Extra prefill length bought by weight compression on 40B, **single pass** | **none** — that ceiling is a PyTorch index limit, not memory (§7) |
-| Extra context bought by compression, **chunked/incremental** | **real** — there the binding constraint is weights + KV, both of which we compress |
-| Evo 2's effective context | **~32 kb**, and *declines* beyond; 8 loci, p = 0.0078 (§10) |
-| Long-range enhancer detection (CRISPRi K562) | **absent past 50 kb**; gene-level p = 0.102 (§11) |
-| bf16 evo2_40b on ONE 80 GB GPU | **cannot load** — OOM at block 46/50 (§12) |
-| int4 evo2_40b on ONE 80 GB GPU | **33.8 GB, 883 tok/s, output identical to 4-GPU**, and 38 % faster than 4 GPUs (§12) |
+*The sections below are the original research log. Script paths beginning
+`experiments/` or `benchmarks/` refer to the lab's private research repository;
+the public equivalents of the two correctness checks are `tests/` in this repo,
+listed above.*
 
 ---
+
 
 ## 2. The measurement
 

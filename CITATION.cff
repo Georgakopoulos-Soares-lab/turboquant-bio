@@ -1,0 +1,31 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite both the paper below and Evo 2 (Arc Institute)."
+title: "TurboQuant-Bio"
+abstract: >-
+  Calibration-free four-bit compression of the Evo 2 genomic foundation model,
+  with a repair for the silently incorrect chunked-prefill path in the released
+  implementation.
+type: software
+license: Apache-2.0
+repository-code: "https://github.com/Georgakopoulos-Soares-lab/turboquant-bio"
+authors:
+  - family-names: Patsakis
+    given-names: Michail
+  - family-names: Tzanakakis
+    given-names: Alexandros
+  - family-names: Georgakopoulos-Soares
+    given-names: Ilias
+    email: ilias@austin.utexas.edu
+preferred-citation:
+  type: article
+  title: >-
+    Calibration-free compression brings Evo 2 to its full million-token context
+    on a single GPU
+  year: 2026
+  authors:
+    - family-names: Patsakis
+      given-names: Michail
+    - family-names: Tzanakakis
+      given-names: Alexandros
+    - family-names: Georgakopoulos-Soares
+      given-names: Ilias

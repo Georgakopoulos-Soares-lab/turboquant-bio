@@ -12,8 +12,10 @@ weights, so it will not load on an 80 GB card at all. With int4 weights it takes
 *faster* on one GPU than on four, because splitting the model across devices means
 copying activations between cards at every layer.
 
-**The 7B on a single A100.** It already fits in bf16 (3.3 GB of weights), and int4
-brings it down far enough for much smaller cards (5.5 GB).
+**A megabase of context on a 40 GB card.** The 7B already fits in bf16 (3.3 GB of
+weights), but its KV cache does not: held to a 40 GB budget it stops at 131,072
+tokens. Compressed, it reaches the full 1,048,576 — eight times the context on
+the same hardware.
 
 **Long sequences that are actually correct.** A single forward pass in Evo 2 is
 capped at 65,536 tokens for the 40B and 131,072 for the 7B. Going beyond that
@@ -109,9 +111,10 @@ model, tok = load_evo2("evo2_40b", tier="tier2", device="auto")
 
 Use this once your sequence gets long. The weights fit on a single card, but the
 KV cache grows with the sequence and eventually will not: scoring a complete
-580 kb bacterial genome in one context peaks at about 45 GB in total. `"auto"`
-spreads that across the GPUs you have, and it still loads straight from the int4
-checkpoint, so the 82 GB bf16 model is never materialized.
+580 kb bacterial genome in one context peaks at 179 GB summed across four cards
+(about 45 GB on each). `"auto"` spreads that across the GPUs you have, and it
+still loads straight from the int4 checkpoint, so the 82 GB bf16 model is never
+materialized.
 
 `score()` gives you the mean log-likelihood per base; higher is better, and human
 DNA usually lands around −0.85 to −1.1. Ask for `return_per_token=True` if you
@@ -152,18 +155,27 @@ tier1 −0.90361, tier2 −0.90698.
 
 ## What runs where
 
-Measured on H100s with the process capped to 80 GB, so the numbers apply to a
-normal 80 GB card. Peak is at 32 kb of context.
+The longest sequence each configuration can score without running out of memory.
+40B rows are on H100s, memory summed over the devices used; 7B rows are a single
+H100 held to a 40 GB allocation cap, so they describe what a 40 GB card does.
 
-| model | tier | GPUs | weights | peak memory | speed |
-|---|---|---|---|---|---|
-| 40B | baseline | 1 × 80 GB | — | — | **will not load** |
-| 40B | tier2 | 1 × 80 GB | 33.8 GB | 49.0 GB | 883 tok/s |
-| 40B | tier2 | 4 × 80 GB | 8.9 GB each | 18.2 GB each | 641 tok/s |
-| 7B | baseline | 1 × A100 | 3.3 GB | comfortable | 4,789 tok/s |
-| 7B | tier2 | 1 × 16 GB | 5.5 GB | comfortable | — |
+| model | tier | GPUs | max context | peak memory |
+|---|---|---|---|---|
+| 40B | baseline (bf16) | 1 × 80 GB | — | **will not load** (82.3 GB of weights) |
+| 40B | tier2 (int4) | 1 × 80 GB | 131,072 | 62.8 GB |
+| 40B | baseline (bf16) | 4 × H100 | 524,288 | OOM beyond |
+| 40B | tier1 (int4 KV) | 4 × H100 | 1,000,000 | 350.2 GB summed |
+| 40B | tier2 (int4) | 4 × H100 | 1,000,000 | 301.7 GB summed |
+| 7B | baseline (bf16) | 40 GB budget | 131,072 | 28.7 GB |
+| 7B | tier2 (int4) | 40 GB budget | 524,288 | 33.4 GB |
+| 7B | tier2, streaming prefill | 40 GB budget | **1,048,576** | 33.7 GB |
 
----
+Decode throughput on the 40B is 883 tok/s on one card against 641 tok/s on four:
+sharding ships activations between cards at every layer, which costs more than
+the parallelism returns. Prompt processing goes the other way — four cards are
+faster, and int4 weights run at roughly half the speed of bf16 at matched
+context, because they must be reconstructed before each matrix multiply.
+Compression buys reach, not speed.
 
 ## Long sequences
 
@@ -230,11 +242,33 @@ plausible-looking output, so agreement with a known value is the only real signa
 * Don't load the model across several GPUs and then move it to one with
   `.to("cuda:0")`. Some internal state is tied to the original device and you
   will get a memory fault. Load it on the device you want.
-* Context beyond roughly 524 kb currently fails in the int4 cache kernel (an
-  indexing overflow we've patched but not yet re-verified at that size).
 * All weights used here are public, so no Hugging Face login is required. If you
   do log in *and* set `HF_HOME`, set `HF_HOME` first — the token is looked up
   relative to it, and a mismatch surfaces as a bare `401`.
+
+---
+
+## Citation
+
+If you use TurboQuant-Bio or the int4 checkpoints, please cite:
+
+```bibtex
+@article{patsakis2026turboquantbio,
+  title  = {Calibration-free compression brings Evo 2 to its full million-token
+            context on a single GPU},
+  author = {Patsakis, Michail and Tzanakakis, Alexandros and
+            Georgakopoulos-Soares, Ilias},
+  year   = {2026},
+  note   = {https://github.com/Georgakopoulos-Soares-lab/turboquant-bio}
+}
+```
+
+Please cite Evo 2 itself as well — the models are Arc Institute's and this
+package only compresses them.
+
+The compression method builds on TurboQuant (Zandieh et al., ICLR 2026,
+arXiv:2504.19874), part of the calibration-free geometric quantization line that
+also includes PolarQuant (Han et al., AISTATS 2026, arXiv:2502.02617).
 
 ---
 

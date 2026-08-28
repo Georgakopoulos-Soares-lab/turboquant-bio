@@ -10,7 +10,7 @@ Why this wrapper exists rather than "call the three installers yourself":
 
 * `install_block_continuation` is NOT optional. Without it, any sequence longer
   than one chunk is silently wrong -- not an approximation, essentially
-  uncorrelated with the truth (see README_chunk_prefill.md). It is applied here
+  uncorrelated with the truth (see FINDINGS.md). It is applied here
   unconditionally so a user cannot forget it.
 * The order of operations matters. A full-precision reference must be computed
   BEFORE a KV tier is installed, because the fused attention does not accept
@@ -39,7 +39,7 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 # Evo 2's benefit from context peaks near here and DECLINES beyond it (8 loci,
-# p = 0.0078; README_chunk_prefill.md §10). Feeding more is not merely wasteful,
+# p = 0.0078; FINDINGS.md §10). Feeding more is not merely wasteful,
 # it measurably hurts.
 EFFECTIVE_CONTEXT = 32_768
 
@@ -65,7 +65,7 @@ def fetch_int4_checkpoint(model_name: str, repo: str = INT4_REPO) -> str:
     if fname is None:
         raise ValueError(f"no int4 checkpoint published for {model_name!r}; "
                          f"build one with "
-                         f"experiments/single_gpu/make_int4_checkpoint.py")
+                         f"tools/make_int4_checkpoint.py")
     from huggingface_hub import hf_hub_download
     return hf_hub_download(repo_id=repo, filename=fname)
 
@@ -93,7 +93,7 @@ def load_evo2(model_name: str = "evo2_7b", tier: str = "baseline",
                  INT4_REPO. Only if that also fails does tier2 fall back to
                  quantizing in place, which needs the full bf16 model resident
                  FIRST (~82 GB for the 40B, i.e. not a single card). Build your
-                 own with experiments/single_gpu/make_int4_checkpoint.py.
+                 own with tools/make_int4_checkpoint.py.
 
     Returns (model, tokenizer).
     """
@@ -187,7 +187,7 @@ def score(model, tok, sequence: str, chunk: int | None = None,
         warnings.warn(
             f"sequence is {len(sequence)} bp but Evo 2's measured effective "
             f"context is ~{EFFECTIVE_CONTEXT} bp; beyond that, extra context "
-            f"reduces accuracy (README_chunk_prefill.md §10).", stacklevel=2)
+            f"reduces accuracy (FINDINGS.md §10).", stacklevel=2)
 
     ids = torch.tensor(tok.tokenize(sequence), dtype=torch.int,
                        device="cuda:0").unsqueeze(0)
